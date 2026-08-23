@@ -1,0 +1,23 @@
+# Downsampling на входе (OSS-способ хранить агрегаты 2 года при сыром
+# retention в 30 дней — 16.6).
+#
+# Сырьё живёт коротко и точно, агрегаты — долго и дёшево.
+
+# ⚠️ quantiles требует ПАРАМЕТРОВ — без них VictoriaMetrics не просто
+# игнорирует правило, а отказывается стартовать целиком:
+# «unsupported output="quantiles"». То есть опечатка в этом файле роняет
+# всё хранилище метрик, и вместе с ним verify — проверку, помогло ли
+# принятое решение. Проверено на себе: с прежней записью сервис
+# перезапускался по кругу.
+- match: '{__name__=~"traces_span_metrics_.*"}'
+  interval: 5m
+  outputs: [total, count_samples, sum_samples, "quantiles(0.5, 0.9, 0.99)"]
+  keep_metric_names: false
+
+- match: '{__name__=~"watchgoose_.*"}'
+  interval: 5m
+  outputs: [avg, max, count_samples]
+
+- match: 'node_filesystem_avail_bytes'
+  interval: 10m
+  outputs: [min, avg]

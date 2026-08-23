@@ -1,0 +1,616 @@
+# Watchgoose — старт и малый прод (раздел 12.1 плана).
+#
+# Один контейнер watchgoose с --role=all плюс готовые хранилища.
+# Ключей моделей здесь нет и не будет: ИИ внешняя, платит её владелец.
+#
+#   docker compose --env-file .env up -d
+#
+# Порты приложений: шлите телеметрию в коллектор на 14317/14318.
+# Порты хоста 4317/4318 занимает Caddy (профиль tls); сам watchgoose
+# слушает их только внутри сети compose — туда пишет коллектор.
+
+name: watchgoose
+
+x-restart: &restart
+  restart: unless-stopped
+
+services:
+  watchgoose:
+    # ⚠️ Образ уже собран установщиком, здесь его НЕ собирают и НЕ тянут.
+    #
+    # Исходники приватные и наружу не уходят. Наружу уходит бинарник,
+    # выложенный в релиз по версиям: install.sh скачивает нужную сборку,
+    # сверяет контрольную сумму и заворачивает её в образ прямо на
+    # сервере. Реестр контейнеров в этой схеме не участвует вовсе.
+    #
+    # Отсюда pull_policy: never. Образ существует только локально, и
+    # попытка сходить за ним в Docker Hub закончилась бы отказом
+    # «pull access denied» — сообщением, по которому причину не найти.
+    #
+    # Тег закрепляют осознанно: latest удобен для пробы, но на боевом
+    # сервере он означает, что переустановка однажды принесёт неожиданную
+    # версию. Ставьте номер: WATCHGOOSE_TAG=1.0.0 в .env.
+    #
+    # Своя сборка из исходников (разработка) — наложением файла рядом:
+    #     docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+    image: ${WATCHGOOSE_IMAGE:-watchgoose}:${WATCHGOOSE_TAG:-latest}
+    pull_policy: never
+    command: ["--role=all"]
+    environment:
+      MANTICORE_DSN: "root@tcp(manticore:9306)/"
+      POSTGRES_DSN: "postgres://watchgoose:${PG_PASS:?нужен PG_PASS}@postgres:5432/watchgoose?sslmode=disable"
+      VICTORIA_URL: "http://victoria:8428"
+      CLICKHOUSE_DSN: "clickhouse://watchgoose:${CH_PASS:?нужен CH_PASS}@clickhouse:9000/otel"
+      MCP_PUBLIC_URL: "${MCP_PUBLIC_URL:-http://localhost:8080/mcp}"
+      MINI_APP_SECRET: "${MINI_APP_SECRET:-}"
+      # ⚠️ Один и тот же секрет с обеих сторон.
+      #
+      # Здесь он ЗАСЕВАЕТ токен роли ingest при первом запуске, ниже —
+      # предъявляется коллектором. Разойдутся — коллектор получит 401,
+      # логи осядут в его дисковой очереди, а снаружи это будет выглядеть
+      # как работающая система с пустым поиском.
+      INGEST_TOKEN: "${INGEST_TOKEN:?нужен INGEST_TOKEN: сгенерируйте openssl rand -hex 32}"
+      GATE_MAX_ESCALATIONS_PER_HOUR: "10"
+      # Проверка обязательного набора атрибутов на приёме:
+      # off | warn | reject.
+      #
+      # ⚠️ Переключать на reject только после того, как показатель
+      # watchgoose_ingest_invalid_total перестал расти: он разложен
+      # по сервисам, видно поимённо, кто ещё не обновил телеметрию.
+      # Включение «сразу» означает потерю логов у тех, кто не успел.
+      WATCHGOOSE_INGEST_REQUIRE_MODE: "${REQUIRE_ATTRS:-warn}"
+      WATCHGOOSE_RETENTION_DISK_PATH: "/var/lib/watchgoose"
+      # ⚠️ /metrics вынесен на отдельный порт и наружу НЕ публикуется.
+      #
+      # Проверку доступа на него не поставить: vmagent токена не носит,
+      # и сбор просто встанет. А отдаёт он перечень сервисов, объёмы логов
+      # по уровням, состояние детекторов и признак открытого приёма —
+      # готовую карту контура любому, кто дотянулся до 8080. Поэтому
+      # маршрут уезжает на 9090, этого порта нет в ports ниже, и ходит
+      # туда только vmagent по внутренней сети compose (deploy/scrape.yml).
+      # Пустое значение вернуло бы /metrics на общий порт.
+      WATCHGOOSE_SERVER_METRICS_ADDR: "${WG_METRICS_ADDR:-:9090}"
+      # Проверка при старте: закрыт ли приёмник коллектора токеном.
+      # Один запрос без заголовка; ответ 200 означает открытую дверь.
+      WATCHGOOSE_INGEST_COLLECTOR_PROBE: "${COLLECTOR_PROBE:-http://otel-collector:4318}"
+      # ⚠️ То же число, что в -retentionPeriod у VictoriaMetrics.
+      # Одна переменная на оба места: разойдутся — предупреждение
+      # о нехватке доли станет неверным.
+      WATCHGOOSE_VICTORIA_RETENTION_MONTHS: "${VICTORIA_RETENTION_MONTHS:-6}"
+      # Доказательства инцидента: сколько строк сохранять рядом с ним
+      # и сколько оставлять от одного шаблона при прореживании.
+      WATCHGOOSE_GATE_EVIDENCE_LINES: "${INCIDENT_LOG_LINES:-500}"
+      WATCHGOOSE_GATE_EVIDENCE_SAMPLES: "${INCIDENT_LOG_SAMPLES:-10}"
+      # Сколько места система себе позволяет ВСЕГО: база, логи,
+      # трассировки и метрики вместе. Задайте — и она сама выстроит
+      # глубину хранения под этот объём; пока занято меньше, ничего
+      # не удаляется досрочно. Пусто — работают предельные сроки.
+      WATCHGOOSE_RETENTION_DISK_BUDGET: "${RETENTION_DISK_BUDGET:-}"
+      # Как этот объём делится. Доля базы резервируется и не ротируется:
+      # там знание, которое не восстанавливается ниоткуда.
+      WATCHGOOSE_RETENTION_SHARES_DATABASE: "${RETENTION_SHARE_DATABASE:-0.15}"
+      WATCHGOOSE_RETENTION_SHARES_METRICS: "${RETENTION_SHARE_METRICS:-0.25}"
+      WATCHGOOSE_RETENTION_SHARES_TRACES: "${RETENTION_SHARE_TRACES:-0.25}"
+      WATCHGOOSE_RETENTION_SHARES_LOGS: "${RETENTION_SHARE_LOGS:-0.35}"
+      # Уборка в базе: убираются служебные записи о прогонах детекторов
+      # и промежуточные замеры. Инциденты, знание и правила не трогаются.
+      WATCHGOOSE_RETENTION_DB_NOISE: "${RETENTION_DB_NOISE:-720h}"
+      WATCHGOOSE_RETENTION_DB_RAW: "${RETENTION_DB_RAW:-2160h}"
+      WATCHGOOSE_RETENTION_METRICS_STALE: "${RETENTION_METRICS_STALE:-720h}"
+      WATCHGOOSE_DETECTORS_RETENTION_SCHEDULE: "${RETENTION_SCHEDULE:-25 * * * *}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+
+      # ── Архив в S3 ────────────────────────────────────────────────────
+      #
+      # Выключен по умолчанию. Профилей два, и путать их не надо:
+      #
+      #   --profile archive        три архивных экземпляра хранилищ —
+      #                            ячейки, куда разворачиваются сутки,
+      #                            поднятые из S3. Нужен ВСЕГДА, когда
+      #                            архив включён: без него сутки уезжают
+      #                            в S3, но прочитать их обратно нечем.
+      #   --profile archive-local  вдобавок поднимает MinIO рядом.
+      #                            Только для проверки и маленьких
+      #                            установок; со своим S3 не нужен.
+      #
+      # ⚠️ Раньше оба сидели в одном профиле, и со внешним S3 выбор был
+      # плохим в обе стороны: включишь — поднимется ненужный MinIO,
+      # не включишь — архив пишется, но не читается.
+      #
+      # ⚠️ Парольную фразу потеряете — архив не прочитать ничем: ключ
+      # выводится из неё argon2id, а сам нигде не хранится. В манифесте
+      # лежат только соль, параметры вывода и key_id — метка ключа.
+      WATCHGOOSE_ARCHIVE_ENABLED: "${ARCHIVE_ENABLED:-false}"
+      WATCHGOOSE_ARCHIVE_ENCRYPTION: "${ARCHIVE_ENCRYPTION:-}"
+      WATCHGOOSE_ARCHIVE_ENCRYPTION_KEY: "${ARCHIVE_ENCRYPTION_KEY:-}"
+      WATCHGOOSE_ARCHIVE_RETENTION_DAYS: "${ARCHIVE_RETENTION_DAYS:-180}"
+      # ⚠️ Пробный режим включён специально.
+      #
+      # Удаление в S3 необратимо. Первый месяц разумно смотреть в журнал
+      # «что удалилось бы», а не проверять срок хранения на своих данных.
+      WATCHGOOSE_ARCHIVE_RETENTION_DRY_RUN: "${ARCHIVE_RETENTION_DRY_RUN:-true}"
+      WATCHGOOSE_ARCHIVE_SCHEDULE: "${ARCHIVE_SCHEDULE:-0 2 * * *}"
+      # Сколько человек и сколько суток каждому: ячеек всего 4×2=8.
+      WATCHGOOSE_ARCHIVE_MAX_USERS: "${ARCHIVE_MAX_USERS:-4}"
+      WATCHGOOSE_ARCHIVE_DAYS_PER_USER: "${ARCHIVE_DAYS_PER_USER:-2}"
+      WATCHGOOSE_ARCHIVE_SLOT_TTL: "${ARCHIVE_SLOT_TTL:-4h}"
+      WATCHGOOSE_ARCHIVE_RESTORE_BYTES: "${ARCHIVE_RESTORE_BYTES:-4GB}"
+      # Куда разворачиваются восстановленные сутки. Отдельные экземпляры:
+      # в живых они сломали бы посуточную раскладку и попали бы под ротацию.
+      WATCHGOOSE_ARCHIVE_LOGS_URL: "root@tcp(manticore-archive:9306)/"
+      WATCHGOOSE_ARCHIVE_TRACES_DSN: "clickhouse://watchgoose:${CH_PASS:?нужен CH_PASS}@clickhouse-archive:9000/otel"
+      WATCHGOOSE_ARCHIVE_METRICS_URL: "http://victoria-archive:8428"
+      S3_ENDPOINT: "${S3_ENDPOINT:-http://minio:9000}"
+      S3_BUCKET: "${S3_BUCKET:-watchgoose}"
+      S3_ACCESS_KEY: "${S3_ACCESS_KEY:-watchgoose}"
+      S3_SECRET_KEY: "${S3_SECRET_KEY:-}"
+      S3_REGION: "${S3_REGION:-us-east-1}"
+      S3_PREFIX: "${S3_PREFIX:-prod/}"
+    # Порты хоста вынесены в переменные: 8080 занят на машинах чаще,
+    # чем свободен, и упираться в это на первом же запуске незачем.
+    ports:
+      # ⚠️ Адрес привязки задаётся, а не берётся по умолчанию.
+      #
+      # Без него Docker публикует на 0.0.0.0 — то есть на все интерфейсы,
+      # включая внешний. На сервере с публичным адресом это открывает
+      # приём телеметрии и интерфейс в интернет. По умолчанию здесь
+      # 127.0.0.1: снаружи ходят через Caddy с сертификатом, а прямой
+      # доступ к портам нужен только для отладки на своей машине.
+      #
+      # ⚠️ Приёмники OTLP (4317/4318) на хосте НЕ публикуются.
+      #
+      # Внутри контейнера они слушают как раньше, но ходит туда только
+      # коллектор — по внутренней сети compose. Публикация тех же портов
+      # на хосте сталкивалась с профилем tls: 4317/4318 берёт Caddy,
+      # и после ./install.sh в режиме letsencrypt или own не поднимался
+      # именно он («port is already allocated»), а он — единственная
+      # дверь снаружи. Снаружи не оставалось ни интерфейса, ни приёма,
+      # хотя внутренний тракт коллектор→watchgoose продолжал работать.
+      #
+      # ⚠️ Порт метрик (9090) здесь тоже НЕ публикуется — намеренно.
+      #
+      # Он и вынесен затем, чтобы инвентарь сервисов и внутренняя
+      # статистика не были доступны никому, кроме vmagent по внутренней
+      # сети. Опубликовав его, вы вернёте ровно ту дыру, ради которой
+      # заводился WATCHGOOSE_SERVER_METRICS_ADDR. Понадобилось посмотреть
+      # руками — `docker compose exec watchgoose wget -qO- localhost:9090/metrics`.
+      - "${WG_BIND:-127.0.0.1}:${WG_HTTP_PORT:-8080}:8080"   # REST + MCP + Web UI
+    volumes:
+      - wg_data:/var/lib/watchgoose
+    # ⚠️ Лимит памяти обязателен, и не только ради соседей по машине.
+    #
+    # Сборщик мусора Go про cgroup-лимит не знает и наращивает кучу,
+    # пока процесс не убьёт ядро. Процесс читает лимит контейнера сам
+    # и назначает себе предел от него — но только если лимит выставлен.
+    # Без него всплеск приёма заканчивается OOM, а это худший исход:
+    # теряется вся очередь принятого, а сегменты WAL остаются помечены
+    # «в работе» и не переиграются.
+    mem_limit: ${WATCHGOOSE_MEM_LIMIT:-2g}
+    depends_on:
+      postgres: {condition: service_healthy}
+      manticore: {condition: service_started}
+      # ⚠️ ClickHouse — по готовности, а не по факту запуска.
+      #
+      # Подключение к нему пробуется один раз при старте: не ответил —
+      # трейсы и холодный слой выключены до перезапуска процесса.
+      # service_started здесь означал бы «иногда со стойками, иногда без».
+      clickhouse: {condition: service_healthy}
+      victoria: {condition: service_started}
+    healthcheck:
+      test: ["CMD", "/watchgoose", "--version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    # Процессу не нужны ни повышение прав, ни линуксовые capability:
+    # он только слушает сокеты и пишет в свой том.
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    <<: *restart
+
+  manticore:
+    image: manticoresearch/manticore:7.4.6
+    environment:
+      EXTRA: 1
+    volumes:
+      - manticore_data:/var/lib/manticore
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
+    # ⚠️ Предел памяти обязателен.
+    #
+    # Manticore держит в памяти незаписанные куски RT-индексов и растёт
+    # под нагрузкой приёма. Без предела всплеск в нём вытеснит с машины
+    # Postgres, а там лежит вся накопленная история разборов — то есть
+    # единственное, что не восстанавливается ниоткуда.
+    mem_limit: ${MANTICORE_MEM_LIMIT:-2g}
+    <<: *restart
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: watchgoose
+      POSTGRES_USER: watchgoose
+      POSTGRES_PASSWORD: ${PG_PASS:?нужен PG_PASS}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U watchgoose"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # ⚠️ Здесь лежит то, что не восстанавливается ниоткуда: инциденты,
+    # знание, правила. Предел ставится не чтобы ограничить Postgres,
+    # а чтобы соседи по машине не могли выдавить его в подкачку.
+    mem_limit: ${POSTGRES_MEM_LIMIT:-1g}
+    <<: *restart
+
+  victoria:
+    image: victoriametrics/victoria-metrics:v1.111.0
+    command:
+      # ⚠️ Единственное хранилище, где срок задаётся календарём.
+      #
+      # VictoriaMetrics не умеет ограничивать себя по объёму, а удалять
+      # конкретные сутки не позволяет её API: только по возрасту
+      # (этим флагом) или ряд целиком со всей историей. Поэтому срок
+      # подбирается под долю: система считает, сколько месяцев влезает
+      # при текущем притоке, и предупреждает заранее.
+      - "-retentionPeriod=${VICTORIA_RETENTION_MONTHS:-6}"
+      - "-storageDataPath=/storage"
+      - "-streamAggr.config=/etc/vm/aggr.yaml"   # downsampling на входе, OSS
+    volumes:
+      - vm_data:/storage
+      - ./vm-aggr.yaml:/etc/vm/aggr.yaml:ro
+    # ⚠️ Предел памяти обязателен: VictoriaMetrics по умолчанию берёт
+    # под кеши долю ОЗУ ВСЕЙ машины и на общем хосте вытесняет соседей.
+    mem_limit: ${VICTORIA_MEM_LIMIT:-1g}
+    <<: *restart
+
+  # ⚠️ Единственная дверь снаружи.
+  #
+  # Профиль tls: без него стек поднимается как раньше, портами на
+  # localhost — так удобно на своей машине. На сервере включается
+  # профилем, и тогда наружу смотрит только Caddy.
+  #
+  #     docker compose --profile tls up -d
+  caddy:
+    image: caddy:2.8-alpine
+    profiles: ["tls"]
+    environment:
+      # ⚠️ Значение по умолчанию, а не обязательная переменная.
+      #
+      # Compose подставляет окружение ВСЕХ служб, даже выключенных
+      # профилем: с «:?» стек не поднимался вовсе, пока не задан домен,
+      # хотя Caddy при этом не запускается. Правильный домен ставит
+      # install.sh, а при ручном запуске без него Caddy честно откажется
+      # выпускать сертификат на localhost.
+      WG_DOMAIN: "${WG_DOMAIN:-localhost}"
+      WG_ACME_EMAIL_LINE: "${WG_ACME_EMAIL_LINE:-}"
+      # Подставляются install.sh по выбранному режиму TLS.
+      WG_SITE_SCHEME: "${WG_SITE_SCHEME:-}"
+      WG_TLS_LINE: "${WG_TLS_LINE:-}"
+      WG_ACME_CA_LINE: "${WG_ACME_CA_LINE:-}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # ⚠️ Тома обязательны: без них выпущенный сертификат теряется
+      # при каждом перезапуске, а у Let's Encrypt есть предел выпусков
+      # на домен — упереться в него можно за один день отладки.
+      - caddy_data:/data
+      - caddy_config:/config
+      # Свой сертификат при WG_TLS_MODE=own кладётся сюда.
+      - ./certs:/certs:ro
+    ports:
+      # Адрес привязки здесь 0.0.0.0, и это осознанно: Caddy и есть дверь
+      # снаружи. Переменная оставлена на случай машины с несколькими
+      # адресами, где наружу смотрит только один из них.
+      - "${WG_PUBLIC_BIND:-0.0.0.0}:80:80"      # проверка владения доменом и переход на https
+      - "${WG_PUBLIC_BIND:-0.0.0.0}:443:443"
+      - "${WG_PUBLIC_BIND:-0.0.0.0}:443:443/udp"
+      - "${WG_PUBLIC_BIND:-0.0.0.0}:4317:4317"  # OTLP gRPC снаружи
+      - "${WG_PUBLIC_BIND:-0.0.0.0}:4318:4318"  # OTLP HTTP снаружи
+    depends_on: [watchgoose, otel-collector]
+    mem_limit: ${CADDY_MEM_LIMIT:-256m}
+    <<: *restart
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    environment:
+      CLICKHOUSE_DB: otel
+      CLICKHOUSE_USER: watchgoose
+      CLICKHOUSE_PASSWORD: ${CH_PASS:?нужен CH_PASS}
+      # ⚠️ Права на управление доступом здесь НЕ выдаются.
+      #
+      # CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT давало этому же пользователю
+      # CREATE USER, GRANT и доступ к named collections. Приложению нужны
+      # только запросы и DDL в базе otel, а утёкший CH_PASS с таким правом
+      # превращается в постоянный аккаунт, который переживёт смену пароля.
+    volumes:
+      - ch_data:/var/lib/clickhouse
+      # ⚠️ Ограничение собственных журналов ClickHouse.
+      #
+      # По умолчанию он пишет в себя больше, чем в него пишем мы:
+      # на стенде полезные данные занимали 55 МиБ, а системные
+      # журналы — 436 МиБ. Подробности и что именно оставлено —
+      # в самом файле.
+      - ./clickhouse/logs.xml:/etc/clickhouse-server/config.d/logs.xml:ro
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
+    # ⚠️ Проверка готовности обязательна, иначе трейсы молча пропадают.
+    #
+    # ClickHouse отвечает «запущен» задолго до того, как начинает
+    # принимать соединения. Watchgoose при отказе подключения пишет
+    # «clickhouse недоступен, трейсы и холодный слой отключены» ОДИН РАЗ
+    # при старте и больше не пробует — до перезапуска процесса. То есть
+    # обычный `compose up`, где ClickHouse поднимается чуть медленнее,
+    # оставляет установку без трассировок, а в интерфейсе появляется
+    # «ClickHouse не подключён», хотя сам он давно работает.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    # ⚠️ Предел памяти обязателен.
+    #
+    # Без него ClickHouse ориентируется на память всей машины
+    # (max_server_memory_usage — 90% ОЗУ) и на общем хосте вытеснит
+    # соседей, включая Postgres, в котором лежит вся история разборов.
+    mem_limit: ${CLICKHOUSE_MEM_LIMIT:-2g}
+    <<: *restart
+
+  # ⚠️ Права на том дисковой очереди коллектора.
+  #
+  # Named volume создаётся с владельцем root, а коллектор работает
+  # от непривилегированного пользователя (uid 10001) — и не может писать
+  # в собственную очередь. Проявляется это не отказом приёма, а тем,
+  # что коллектор вообще не стартует: «permission denied» на
+  # /var/lib/otelcol.
+  #
+  # Хуже другое: дисковая очередь — это и есть защита от потери логов,
+  # пока watchgoose перезапускается. Молча работающий коллектор БЕЗ неё
+  # был бы опаснее падающего.
+  #
+  # Разовый контейнер выставляет владельца и завершается.
+  otel-queue-init:
+    image: busybox:1.36
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 10001:10001 /var/lib/otelcol"]
+    volumes:
+      - otel_queue:/var/lib/otelcol
+    restart: "no"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.116.1
+    command: ["--config=/etc/otel.yaml"]
+    environment:
+      CH_PASS: ${CH_PASS:?нужен CH_PASS}
+      # Тот же секрет, что и у watchgoose: иначе приём ответит 401
+      # и логи будут копиться в очереди коллектора, а не доходить.
+      INGEST_TOKEN: "${INGEST_TOKEN:?тот же секрет, что у watchgoose}"
+    volumes:
+      - ./otel.yaml:/etc/otel.yaml:ro
+      - otel_queue:/var/lib/otelcol
+    ports:
+      # ⚠️ Сюда шлют приложения — и это единственная дверь наружу
+      # для телеметрии. Она закрыта токеном (см. auth в otel.yaml),
+      # но публиковать её на все интерфейсы всё равно незачем:
+      # снаружи ходят через Caddy, который добавляет TLS.
+      - "${WG_BIND:-127.0.0.1}:${OTEL_GRPC_PORT:-14317}:4317"
+      - "${WG_BIND:-127.0.0.1}:${OTEL_HTTP_PORT:-14318}:4318"
+    depends_on:
+      otel-queue-init: {condition: service_completed_successfully}
+      watchgoose: {condition: service_started}
+      clickhouse: {condition: service_started}
+      victoria: {condition: service_started}
+    # ⚠️ Предел памяти и защита очереди.
+    #
+    # Коллектор копит принятое в памяти, пока watchgoose перезапускается.
+    # Без предела он вырастет настолько, что ядро убьёт ИМЕННО ЕГО —
+    # вместе со всем, что он ещё не успел передать.
+    mem_limit: ${OTEL_MEM_LIMIT:-1g}
+    <<: *restart
+
+  # Метрики хостов обязательны, а не опция (16.1): без них не работает verify,
+  # а без verify система не знает, какое решение помогает.
+  # ⚠️ Метрики железа снимаются только на Linux-хосте, и поэтому
+  # node-exporter вынесен в отдельный профиль.
+  #
+  # Он монтирует корень хоста, чтобы видеть диски и память машины.
+  # На Docker Desktop (Windows, macOS) такой монтаж невозможен в принципе:
+  # контейнеры живут в виртуальной машине, а её корень — не корень вашего
+  # компьютера. Раньше это ронял весь `docker compose up` целиком
+  # с сообщением «path / is mounted on / but it is not a shared or slave
+  # mount», и стек не поднимался вообще — из-за необязательной части.
+  #
+  # На боевом Linux-хосте включайте так:
+  #     docker compose --profile host-metrics up -d
+  #
+  # Без него не будет только двух наблюдателей: «свободное место на диске»
+  # и «занятая память». Всё остальное работает.
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    profiles: ["host-metrics"]
+    command: ["--path.rootfs=/host"]
+    volumes: ["/:/host:ro,rslave"]
+    pid: host
+    mem_limit: ${NODE_EXPORTER_MEM_LIMIT:-128m}
+    <<: *restart
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    environment:
+      DATA_SOURCE_NAME: "postgresql://watchgoose:${PG_PASS:?нужен PG_PASS}@postgres:5432/watchgoose?sslmode=disable"
+    depends_on: [postgres]
+    mem_limit: ${PG_EXPORTER_MEM_LIMIT:-128m}
+    <<: *restart
+
+  vmagent:
+    image: victoriametrics/vmagent:v1.111.0
+    command:
+      - "-promscrape.config=/etc/vmagent/scrape.yml"
+      - "-remoteWrite.url=http://victoria:8428/api/v1/write"
+    volumes:
+      - ./scrape.yml:/etc/vmagent/scrape.yml:ro
+    depends_on: [victoria]
+    mem_limit: ${VMAGENT_MEM_LIMIT:-256m}
+    <<: *restart
+
+  # ── Архив ──────────────────────────────────────────────────────────
+  #
+  # Профиль archive: хранилище объектов и три экземпляра под
+  # восстановленные сутки.
+  #
+  #     docker compose --profile archive up -d
+  #
+  # ⚠️ MinIO здесь — для проверки и небольших установок.
+  #
+  # На боевой машине задайте S3_ENDPOINT внешнего хранилища и профиль
+  # archive-local НЕ включайте: смысл архива в том, что данные лежат
+  # ОТДЕЛЬНО от машины, которая может умереть вместе со своим диском.
+  # Ячейки восстановления при этом всё равно нужны — они в профиле
+  # archive, включайте только его.
+  minio:
+    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+    profiles: ["archive-local"]
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: "${S3_ACCESS_KEY:-watchgoose}"
+      # ⚠️ Значение по умолчанию, а не обязательная переменная.
+      #
+      # Compose подставляет окружение ВСЕХ служб, даже выключенных
+      # профилем: с «:?» стек не поднялся бы вовсе, пока не задан ключ
+      # S3 — хотя MinIO при этом не запускается. Пустой пароль MinIO
+      # не примет и откажется стартовать сам, внятным сообщением.
+      MINIO_ROOT_PASSWORD: "${S3_SECRET_KEY:-}"
+    volumes:
+      - minio_data:/data
+    ports:
+      - "${WG_BIND:-127.0.0.1}:${MINIO_PORT:-9000}:9000"
+      - "${WG_BIND:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    mem_limit: ${MINIO_MEM_LIMIT:-512m}
+    <<: *restart
+
+  # ⚠️ Бакет создаётся отдельным разовым контейнером.
+  #
+  # Watchgoose его НЕ создаёт сам: право на создание бакетов — это право
+  # менять раскладку всего хранилища, и выдавать его системе, которая
+  # только пишет туда суточные архивы, незачем. Здесь же, на стенде,
+  # бакета иначе просто не будет, и первая выгрузка отвалится.
+  minio-init:
+    image: minio/mc:RELEASE.2024-11-05T11-29-45Z
+    profiles: ["archive-local"]
+    depends_on:
+      minio: {condition: service_healthy}
+    entrypoint: >
+      sh -c "mc alias set wg http://minio:9000 '${S3_ACCESS_KEY:-watchgoose}' '${S3_SECRET_KEY:-}'
+      && mc mb --ignore-existing wg/${S3_BUCKET:-watchgoose}
+      && echo 'бакет готов'"
+    restart: "no"
+
+  # ⚠️ Отдельный экземпляр под восстановленные сутки, а не живой.
+  #
+  # Сутки полугодовой давности в живом Manticore сломали бы посуточную
+  # раскладку, попали бы под ротацию и вытеснили свежие данные —
+  # то есть просмотр истории ломал бы работу системы.
+  manticore-archive:
+    image: manticoresearch/manticore:7.4.6
+    profiles: ["archive"]
+    environment:
+      EXTRA: 1
+    volumes:
+      - manticore_archive:/var/lib/manticore
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
+    mem_limit: ${MANTICORE_ARCHIVE_MEM_LIMIT:-1g}
+    <<: *restart
+
+  clickhouse-archive:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    profiles: ["archive"]
+    environment:
+      CLICKHOUSE_DB: otel
+      CLICKHOUSE_USER: watchgoose
+      CLICKHOUSE_PASSWORD: ${CH_PASS:?нужен CH_PASS}
+    volumes:
+      - ch_archive:/var/lib/clickhouse
+      - ./clickhouse/logs.xml:/etc/clickhouse-server/config.d/logs.xml:ro
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
+    mem_limit: ${CLICKHOUSE_ARCHIVE_MEM_LIMIT:-1g}
+    <<: *restart
+
+  victoria-archive:
+    image: victoriametrics/victoria-metrics:v1.111.0
+    profiles: ["archive"]
+    command:
+      # ⚠️ Срок здесь ДЛИННЫЙ, и удаление идёт не по нему.
+      #
+      # Восстановленные сутки убираются по метке, когда ячейка
+      # освобождается. Календарный срок тут только страховка от мусора,
+      # оставшегося после сбоя: поставь его коротким — и сутки годовой
+      # давности удалились бы через минуту после загрузки.
+      - "-retentionPeriod=100y"
+      - "-storageDataPath=/storage"
+    volumes:
+      - vm_archive:/storage
+    mem_limit: ${VICTORIA_ARCHIVE_MEM_LIMIT:-1g}
+    <<: *restart
+
+  # ⚠️ Grafana НЕ входит в состав системы и по умолчанию не поднимается.
+  #
+  # Watchgoose работает без неё полностью: поиск, инциденты, графики
+  # и дашборды у него свои. Grafana нужна тем, у кого она уже стоит
+  # и кто хочет строить по этим же данным свои панели.
+  #
+  #     docker compose --profile grafana up -d
+  #
+  # Раньше она поднималась всегда — и это была дыра: контейнер публиковал
+  # порт 3000 на ВСЕ интерфейсы с паролем admin по умолчанию. На сервере
+  # с внешним адресом это открытая панель с доступом к тем же данным,
+  # что и у самой системы.
+  grafana:
+    image: grafana/grafana:11.4.0
+    profiles: ["grafana"]
+    environment:
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
+      # ⚠️ Пароли к источникам нужны САМОЙ Grafana, а не стенду.
+      #
+      # grafana/datasources.yaml подставляет ${CH_PASS} и ${PG_PASS} из окружения
+      # СВОЕГО процесса. Не передашь сюда — они развернутся в пустую строку,
+      # и «Трейсы» с «Состоянием» провизионятся с пустым паролем: источник
+      # создан и выглядит настроенным, а любой запрос к нему получает отказ.
+      CH_PASS: ${CH_PASS:?нужен CH_PASS}
+      PG_PASS: ${PG_PASS:?нужен PG_PASS}
+      # ⚠️ Пустой пароль вместо admin: Grafana с ним не стартует
+      # и скажет об этом сама. Молчаливый admin/admin хуже отказа.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASS:-}
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/datasources.yaml:/etc/grafana/provisioning/datasources/ds.yaml:ro
+      - ./grafana/dashboards.yaml:/etc/grafana/provisioning/dashboards/dash.yaml:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    # ⚠️ Адрес привязки задаётся, как у всего остального: без него Docker
+    # публикует порт на всех интерфейсах, включая внешний.
+    ports: ["${WG_BIND:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"]
+    depends_on: [victoria, clickhouse, postgres]
+    mem_limit: ${GRAFANA_MEM_LIMIT:-512m}
+    <<: *restart
+
+volumes:
+  caddy_data:
+  caddy_config:
+  wg_data: {}
+  manticore_data: {}
+  pg_data: {}
+  vm_data: {}
+  ch_data: {}
+  grafana_data: {}
+  otel_queue: {}
+  minio_data: {}
+  manticore_archive: {}
+  ch_archive: {}
+  vm_archive: {}
