@@ -17,6 +17,43 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# ── Режим работы ────────────────────────────────────────────────────────────
+#
+# ⚠️ Обновление — ОТДЕЛЬНЫЙ режим, а не повторная установка.
+#
+# Раньше поднять новую версию можно было только прогнав установщик целиком:
+# он заново спрашивал про домен, сертификат, бюджет и S3, и приходилось
+# жать Enter десять раз, чтобы поменять один номер сборки. Хуже того, файлы
+# развёртывания при этом НЕ обновлялись — установщик существующие не трогает.
+# Новый бинарник с прошлым docker-compose.yml — это расхождение, которое
+# ломается молча и разбирается долго.
+UPDATE_MODE=0
+TAG_OVERRIDE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --update|-u) UPDATE_MODE=1 ;;
+        --tag=*)     TAG_OVERRIDE="${1#--tag=}" ;;
+        --tag)       shift; TAG_OVERRIDE="${1:-}" ;;
+        -h|--help)
+            cat <<СПРАВКА
+Установка и обновление Watchgoose.
+
+  ./install.sh              установка: спросит домен, бюджет, S3
+  ./install.sh --update     обновление: ничего не спрашивает, берёт всё из .env
+  ./install.sh --update --tag=1.1.0
+                            обновление до конкретной версии
+
+Переменные окружения:
+  WATCHGOOSE_TAG   версия сборки (по умолчанию latest)
+  WG_REF           ветка репозитория с файлами развёртывания
+  WG_PROJECT       владелец/репозиторий на GitHub
+СПРАВКА
+            exit 0 ;;
+        *) echo "неизвестный аргумент: $1 (см. --help)" >&2; exit 1 ;;
+    esac
+    shift
+done
+
 # ── Откуда берётся выпуск ───────────────────────────────────────────────────
 #
 # Исходники приватные и лежат в другом месте. Публичная сторона — этот
@@ -218,7 +255,7 @@ docker compose version >/dev/null 2>&1 || die "docker compose v2 не найде
 if ! docker version >/dev/null 2>&1; then
     warn "docker установлен, но недоступен этому пользователю"
     info "добавьте себя в группу и перезайдите:"
-    info "  sudo usermod -aG docker $USER && newgrp docker"
+    info "  sudo usermod -aG docker ${USER:-$(id -un)} && newgrp docker"
     die "после этого запустите install.sh заново"
 fi
 info "docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?')"
@@ -270,192 +307,249 @@ fi
 load_env
 [ -f "$ENV_FILE" ] && info "найден $ENV_FILE — заданное сохраню"
 
-# ── Домен и сертификат ──────────────────────────────────────────────────────
-say "Домен и сертификат"
-cat <<'ТЕКСТ'
-  Режимы:
-    letsencrypt — сертификат выпускается сам. Нужны запись DNS на этот
-                  сервер и открытые снаружи порты 80 и 443.
-    own         — свой сертификат: положите fullchain.pem и privkey.pem
-                  в deploy/certs.
-    off         — без шифрования. Годится только для своей машины:
-                  токены пойдут открытым текстом.
-ТЕКСТ
-ask WG_TLS_MODE "Режим (letsencrypt/own/off)" "letsencrypt"
+if [ "$UPDATE_MODE" = "0" ]; then
 
-case "$(get WG_TLS_MODE)" in
-    letsencrypt)
-        ask WG_DOMAIN "Домен" ""
-        ask WG_ACME_EMAIL "Почта для уведомлений удостоверяющего центра" ""
-        [ -n "$(get WG_DOMAIN)" ] || die "для letsencrypt нужен домен"
-        set_value WG_SITE_SCHEME ""
-        set_value WG_TLS_LINE ""
-        set_value WG_ACME_CA_LINE ""
-        set_value WG_ACME_EMAIL_LINE "email $(get WG_ACME_EMAIL)"
-        ;;
-    own)
-        ask WG_DOMAIN "Домен" ""
-        set_value WG_SITE_SCHEME ""
-        set_value WG_TLS_LINE "tls /certs/fullchain.pem /certs/privkey.pem"
-        set_value WG_ACME_CA_LINE ""
-        set_value WG_ACME_EMAIL_LINE ""
-        mkdir -p deploy/certs
-        if [ ! -f deploy/certs/fullchain.pem ]; then
-            warn "положите fullchain.pem и privkey.pem в deploy/certs — без них Caddy не поднимется"
-        fi
-        ;;
-    off)
-        ask WG_DOMAIN "Адрес (домен или localhost)" "localhost"
-        set_value WG_SITE_SCHEME "http://"
-        set_value WG_TLS_LINE ""
-        set_value WG_ACME_CA_LINE ""
-        set_value WG_ACME_EMAIL_LINE ""
-        warn "без шифрования токены доступа передаются открытым текстом"
-        ;;
-    *) die "неизвестный режим: $(get WG_TLS_MODE)" ;;
-esac
-
-# ⚠️ Порты наружу открывает Caddy, а остальные контейнеры остаются
-# на localhost. Без TLS Caddy не нужен, и тогда порты публикует сам
-# watchgoose — тоже на localhost.
-if [ "$(get WG_TLS_MODE)" = "off" ]; then
-    set_value WG_BIND "127.0.0.1"
-else
-    set_value WG_BIND "127.0.0.1"
-fi
-
-# ── Секреты ─────────────────────────────────────────────────────────────────
-say "Секреты"
-secret PG_PASS 24
-secret CH_PASS 24
-secret INGEST_TOKEN 32
-secret MINI_APP_SECRET 32
-secret ARCHIVE_ENCRYPTION_KEY 32
-
-# ── Место ───────────────────────────────────────────────────────────────────
-say "Сколько места система себе позволяет"
-cat <<'ТЕКСТ'
-  Это объём НА ВСЁ вместе: база знаний, логи, трассировки и метрики.
-  Пока занято меньше — ничего не удаляется досрочно.
-  Пусто — ограничения по объёму нет.
-ТЕКСТ
-ask RETENTION_DISK_BUDGET "Бюджет (например 200GB)" "200GB"
-
-# ── Архив ───────────────────────────────────────────────────────────────────
-say "Архив в S3"
-# ⚠️ По умолчанию ВКЛЮЧЁН.
-#
-# Раньше умолчанием было «нет», и установка молча проходила мимо архива:
-# логи жили ровно до того, как упрутся в бюджет диска и уйдут под нож
-# ротации. Обнаруживалось это в день, когда за старыми логами приходили
-# и не находили. Хранилище — не украшение, а единственное место, откуда
-# сутки можно вернуть, поэтому вопрос задаётся с ответом «да», а отказ
-# требует осознанного «нет».
-info "Хранит посуточные батчи логов, трассировок и метрик, а также логи инцидентов."
-info "Без него сутки удаляются ротацией безвозвратно, когда кончится место."
-ask ARCHIVE_ENABLED "Включить архив? (true/false)" "true"
-
-# ⚠️ Профили считаем здесь, а поднимаем ниже одним вызовом.
-#
-# archive       — ячейки восстановления. Нужны ВСЕГДА при включённом
-#                 архиве: без них сутки уезжают в S3 и не читаются обратно.
-# archive-local — вдобавок MinIO рядом. Только когда своего S3 нет.
-ARCHIVE_PROFILES=()
-
-if [ "$(get ARCHIVE_ENABLED)" = "true" ]; then
+    # ── Домен и сертификат ──────────────────────────────────────────────────────
+    say "Домен и сертификат"
     cat <<'ТЕКСТ'
-  Своё хранилище или встроенное?
-    свой   — S3 уже есть (облако, MinIO на другой машине, любой S3-совместимый).
-             Так и надо в бою: архив переживёт смерть этой машины.
-    рядом  — поднять MinIO этим же compose. Годится для проверки и малых
-             установок, но лежать он будет на том же диске.
+      Режимы:
+        letsencrypt — сертификат выпускается сам. Нужны запись DNS на этот
+                      сервер и открытые снаружи порты 80 и 443.
+        own         — свой сертификат: положите fullchain.pem и privkey.pem
+                      в deploy/certs.
+        off         — без шифрования. Годится только для своей машины:
+                      токены пойдут открытым текстом.
 ТЕКСТ
-    ask S3_KIND "Хранилище (свой/рядом)" "свой"
+    ask WG_TLS_MODE "Режим (letsencrypt/own/off)" "letsencrypt"
 
-    if [ "$(get S3_KIND)" = "рядом" ]; then
-        ARCHIVE_PROFILES+=(--profile archive-local)
-        set_value S3_ENDPOINT "http://minio:9000"
-        set_value S3_REGION "us-east-1"
-        ask S3_BUCKET "Бакет" "watchgoose"
-        secret S3_ACCESS_KEY 12
-        secret S3_SECRET_KEY 24
-        info "MinIO поднимется рядом, ключи сгенерированы"
+    case "$(get WG_TLS_MODE)" in
+        letsencrypt)
+            ask WG_DOMAIN "Домен" ""
+            ask WG_ACME_EMAIL "Почта для уведомлений удостоверяющего центра" ""
+            [ -n "$(get WG_DOMAIN)" ] || die "для letsencrypt нужен домен"
+            set_value WG_SITE_SCHEME ""
+            set_value WG_TLS_LINE ""
+            set_value WG_ACME_CA_LINE ""
+            set_value WG_ACME_EMAIL_LINE "email $(get WG_ACME_EMAIL)"
+            ;;
+        own)
+            ask WG_DOMAIN "Домен" ""
+            set_value WG_SITE_SCHEME ""
+            set_value WG_TLS_LINE "tls /certs/fullchain.pem /certs/privkey.pem"
+            set_value WG_ACME_CA_LINE ""
+            set_value WG_ACME_EMAIL_LINE ""
+            mkdir -p deploy/certs
+            if [ ! -f deploy/certs/fullchain.pem ]; then
+                warn "положите fullchain.pem и privkey.pem в deploy/certs — без них Caddy не поднимется"
+            fi
+            ;;
+        off)
+            ask WG_DOMAIN "Адрес (домен или localhost)" "localhost"
+            set_value WG_SITE_SCHEME "http://"
+            set_value WG_TLS_LINE ""
+            set_value WG_ACME_CA_LINE ""
+            set_value WG_ACME_EMAIL_LINE ""
+            warn "без шифрования токены доступа передаются открытым текстом"
+            ;;
+        *) die "неизвестный режим: $(get WG_TLS_MODE)" ;;
+    esac
+
+    # ⚠️ Порты наружу открывает Caddy, а остальные контейнеры остаются
+    # на localhost. Без TLS Caddy не нужен, и тогда порты публикует сам
+    # watchgoose — тоже на localhost.
+    if [ "$(get WG_TLS_MODE)" = "off" ]; then
+        set_value WG_BIND "127.0.0.1"
     else
-        info "адрес с http:// или https://, например https://storage.yandexcloud.net"
-        ask S3_ENDPOINT "Адрес S3" ""
-        ask S3_BUCKET "Бакет" "watchgoose-archive"
-        ask S3_REGION "Регион" "ru-central1"
-        ask S3_ACCESS_KEY "Ключ доступа" ""
-        ask S3_SECRET_KEY "Секретный ключ" ""
-
-        [ -n "$(get S3_ENDPOINT)" ] || die "без адреса S3 архив не включить"
-        [ -n "$(get S3_ACCESS_KEY)" ] || die "нужен ключ доступа к S3"
-        [ -n "$(get S3_SECRET_KEY)" ] || die "нужен секретный ключ к S3"
-        case "$(get S3_ENDPOINT)" in
-            http://*|https://*) ;;
-            *) die "адрес S3 должен начинаться с http:// или https://" ;;
-        esac
-
-        # ⚠️ Проверяем ДОСТУП СЕЙЧАС, а не в 02:00 первой ночи.
-        #
-        # Выгрузка идёт по расписанию раз в сутки. Опечатка в ключе или
-        # закрытый бакет обнаружились бы строкой в журнале через сутки,
-        # а заметили бы её через месяц — когда за архивом придут и не найдут.
-        # Проверка стоит одного запуска mc, образ уже используется стеком.
-        say "Проверяю доступ к S3"
-        # ⚠️ --entrypoint sh обязателен: у образа mc точка входа — сам mc,
-        # и без подмены он принимает «sh» за свою подкоманду и отвечает
-        # «`sh` is not a recognized command». Проверка при этом всегда
-        # падала бы, пугая исправной настройкой.
-        if docker run --rm --entrypoint sh minio/mc:RELEASE.2024-11-05T11-29-45Z -c "
-                mc alias set chk '$(get S3_ENDPOINT)' '$(get S3_ACCESS_KEY)' '$(get S3_SECRET_KEY)' >/dev/null 2>&1 &&
-                mc ls chk/'$(get S3_BUCKET)' >/dev/null 2>&1" 2>/dev/null; then
-            info "доступ есть, бакет $(get S3_BUCKET) виден"
-        else
-            warn "не удалось прочитать бакет $(get S3_BUCKET) по адресу $(get S3_ENDPOINT)"
-            warn "причины обычно три: опечатка в ключах, бакет не создан, адрес недоступен с этой машины"
-            confirm "Всё равно продолжить?" || die "поправьте доступ к S3 и запустите заново"
-        fi
+        set_value WG_BIND "127.0.0.1"
     fi
 
-    ask S3_PREFIX "Префикс" "prod/"
-    ask ARCHIVE_RETENTION_DAYS "Сколько суток хранить батчи" "180"
+    # ── Секреты ─────────────────────────────────────────────────────────────────
+    say "Секреты"
+    secret PG_PASS 24
+    secret CH_PASS 24
+    secret INGEST_TOKEN 32
+    secret MINI_APP_SECRET 32
+    secret ARCHIVE_ENCRYPTION_KEY 32
 
-    # Ячейки восстановления нужны при любом виде хранилища.
-    ARCHIVE_PROFILES+=(--profile archive)
+    # ── Место ───────────────────────────────────────────────────────────────────
+    say "Сколько места система себе позволяет"
+    cat <<'ТЕКСТ'
+      Это объём НА ВСЁ вместе: база знаний, логи, трассировки и метрики.
+      Пока занято меньше — ничего не удаляется досрочно.
+      Пусто — ограничения по объёму нет.
+ТЕКСТ
+    ask RETENTION_DISK_BUDGET "Бюджет (например 200GB)" "200GB"
 
-    warn "логи инцидентов из архива не удаляются никогда, срок их не касается"
-    warn "ARCHIVE_ENCRYPTION_KEY: потеряете — архив не прочитать. Сохраните отдельно."
-    info "удаление старого в S3 идёт в пробном режиме: ARCHIVE_RETENTION_DRY_RUN=true"
-    info "посмотрите месяц в журнал «что удалилось бы» и снимите его осознанно"
+    # ── Архив ───────────────────────────────────────────────────────────────────
+    say "Архив в S3"
+    # ⚠️ По умолчанию ВКЛЮЧЁН.
+    #
+    # Раньше умолчанием было «нет», и установка молча проходила мимо архива:
+    # логи жили ровно до того, как упрутся в бюджет диска и уйдут под нож
+    # ротации. Обнаруживалось это в день, когда за старыми логами приходили
+    # и не находили. Хранилище — не украшение, а единственное место, откуда
+    # сутки можно вернуть, поэтому вопрос задаётся с ответом «да», а отказ
+    # требует осознанного «нет».
+    info "Хранит посуточные батчи логов, трассировок и метрик, а также логи инцидентов."
+    info "Без него сутки удаляются ротацией безвозвратно, когда кончится место."
+    ask ARCHIVE_ENABLED "Включить архив? (true/false)" "true"
+
+    # ⚠️ Профили считаем здесь, а поднимаем ниже одним вызовом.
+    #
+    # archive       — ячейки восстановления. Нужны ВСЕГДА при включённом
+    #                 архиве: без них сутки уезжают в S3 и не читаются обратно.
+    # archive-local — вдобавок MinIO рядом. Только когда своего S3 нет.
+    ARCHIVE_PROFILES=()
+
+    if [ "$(get ARCHIVE_ENABLED)" = "true" ]; then
+        cat <<'ТЕКСТ'
+      Своё хранилище или встроенное?
+        свой   — S3 уже есть (облако, MinIO на другой машине, любой S3-совместимый).
+                 Так и надо в бою: архив переживёт смерть этой машины.
+        рядом  — поднять MinIO этим же compose. Годится для проверки и малых
+                 установок, но лежать он будет на том же диске.
+ТЕКСТ
+        ask S3_KIND "Хранилище (свой/рядом)" "свой"
+
+        if [ "$(get S3_KIND)" = "рядом" ]; then
+            ARCHIVE_PROFILES+=(--profile archive-local)
+            set_value S3_ENDPOINT "http://minio:9000"
+            set_value S3_REGION "us-east-1"
+            ask S3_BUCKET "Бакет" "watchgoose"
+            secret S3_ACCESS_KEY 12
+            secret S3_SECRET_KEY 24
+            info "MinIO поднимется рядом, ключи сгенерированы"
+        else
+            info "адрес с http:// или https://, например https://storage.yandexcloud.net"
+            ask S3_ENDPOINT "Адрес S3" ""
+            ask S3_BUCKET "Бакет" "watchgoose-archive"
+            ask S3_REGION "Регион" "ru-central1"
+            ask S3_ACCESS_KEY "Ключ доступа" ""
+            ask S3_SECRET_KEY "Секретный ключ" ""
+
+            [ -n "$(get S3_ENDPOINT)" ] || die "без адреса S3 архив не включить"
+            [ -n "$(get S3_ACCESS_KEY)" ] || die "нужен ключ доступа к S3"
+            [ -n "$(get S3_SECRET_KEY)" ] || die "нужен секретный ключ к S3"
+            case "$(get S3_ENDPOINT)" in
+                http://*|https://*) ;;
+                *) die "адрес S3 должен начинаться с http:// или https://" ;;
+            esac
+
+            # ⚠️ Проверяем ДОСТУП СЕЙЧАС, а не в 02:00 первой ночи.
+            #
+            # Выгрузка идёт по расписанию раз в сутки. Опечатка в ключе или
+            # закрытый бакет обнаружились бы строкой в журнале через сутки,
+            # а заметили бы её через месяц — когда за архивом придут и не найдут.
+            # Проверка стоит одного запуска mc, образ уже используется стеком.
+            say "Проверяю доступ к S3"
+            # ⚠️ --entrypoint sh обязателен: у образа mc точка входа — сам mc,
+            # и без подмены он принимает «sh» за свою подкоманду и отвечает
+            # «`sh` is not a recognized command». Проверка при этом всегда
+            # падала бы, пугая исправной настройкой.
+            if docker run --rm --entrypoint sh minio/mc:RELEASE.2024-11-05T11-29-45Z -c "
+                    mc alias set chk '$(get S3_ENDPOINT)' '$(get S3_ACCESS_KEY)' '$(get S3_SECRET_KEY)' >/dev/null 2>&1 &&
+                    mc ls chk/'$(get S3_BUCKET)' >/dev/null 2>&1" 2>/dev/null; then
+                info "доступ есть, бакет $(get S3_BUCKET) виден"
+            else
+                warn "не удалось прочитать бакет $(get S3_BUCKET) по адресу $(get S3_ENDPOINT)"
+                warn "причины обычно три: опечатка в ключах, бакет не создан, адрес недоступен с этой машины"
+                confirm "Всё равно продолжить?" || die "поправьте доступ к S3 и запустите заново"
+            fi
+        fi
+
+        ask S3_PREFIX "Префикс" "prod/"
+        ask ARCHIVE_RETENTION_DAYS "Сколько суток хранить батчи" "180"
+
+        # Ячейки восстановления нужны при любом виде хранилища.
+        ARCHIVE_PROFILES+=(--profile archive)
+
+        warn "логи инцидентов из архива не удаляются никогда, срок их не касается"
+        warn "ARCHIVE_ENCRYPTION_KEY: потеряете — архив не прочитать. Сохраните отдельно."
+        info "удаление старого в S3 идёт в пробном режиме: ARCHIVE_RETENTION_DRY_RUN=true"
+        info "посмотрите месяц в журнал «что удалилось бы» и снимите его осознанно"
+    fi
+
+    # ── Запись .env ─────────────────────────────────────────────────────────────
+    # ── Запуск ──────────────────────────────────────────────────────────────────
+    # Кладём выбор образа в .env: дальше человек работает обычным
+    # docker compose, без установщика, и должен получать ТО ЖЕ самое.
+    set_value WATCHGOOSE_IMAGE "$WATCHGOOSE_IMAGE"
+    set_value WATCHGOOSE_TAG "$WATCHGOOSE_TAG"
+
+    say "Записываю $ENV_FILE"
+    # ⚠️ Права ставим ДО первого байта, а не после записи.
+    #
+    # Перенаправление создаёт файл с 0666 & ~umask, то есть на типовой машине
+    # 0644, и он остаётся читаемым всем, пока блок ниже отрабатывает вместе
+    # с подпроцессом sort. Внутри к тому времени уже лежат PG_PASS, CH_PASS,
+    # INGEST_TOKEN, MINI_APP_SECRET и ARCHIVE_ENCRYPTION_KEY — одного чтения
+    # в этом окне хватает. chmod после записи оставлен страховкой.
+    : > "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    {
+        echo "# Создан install.sh — правьте руками, скрипт заданное не перетирает."
+        for key in "${!ENV_VALUES[@]}"; do
+            printf '%s=%s\n' "$key" "${ENV_VALUES[$key]}"
+        done | sort
+    } > "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    info "права 600: внутри секреты"
+
+
+
+else
+    # ── Обновление ──────────────────────────────────────────────────────────
+    #
+    # Ничего не спрашиваем: всё уже отвечено при установке и лежит в .env.
+    [ -f "$ENV_FILE" ] || die "нет $ENV_FILE — это не обновление, а первая установка: запустите без --update"
+
+    WATCHGOOSE_TAG="${TAG_OVERRIDE:-$(get WATCHGOOSE_TAG)}"
+    WATCHGOOSE_TAG="${WATCHGOOSE_TAG:-latest}"
+    export WATCHGOOSE_TAG
+
+    # Профили восстанавливаем из ответов прошлой установки, а не спрашиваем.
+    ARCHIVE_PROFILES=()
+    if [ "$(get ARCHIVE_ENABLED)" = "true" ]; then
+        [ "$(get S3_KIND)" = "рядом" ] && ARCHIVE_PROFILES+=(--profile archive-local)
+        ARCHIVE_PROFILES+=(--profile archive)
+    fi
+
+    # ⚠️ Файлы развёртывания ОБНОВЛЯЮТСЯ, и это половина смысла режима.
+    #
+    # Новая версия может требовать новой переменной окружения или новой
+    # службы в compose. Оставив прежние файлы, мы получили бы свежий
+    # бинарник в прошлом окружении — расхождение, которое ломается молча.
+    # Изменённое не затирается бесследно: прежний файл ложится рядом
+    # с меткой времени, чтобы правку, сделанную руками на сервере, можно
+    # было вернуть.
+    say "Обновляю файлы развёртывания"
+    UPD_TMP="$(mktemp -d)"
+    STAMP="$(date +%Y%m%d-%H%M%S)"
+    ИЗМЕНЕНО=0
+    for f in deploy/docker-compose.yml deploy/otel.yaml deploy/scrape.yml              deploy/Caddyfile deploy/clickhouse/logs.xml deploy/vm-aggr.yaml              deploy/Dockerfile.release; do
+        mkdir -p "$UPD_TMP/$(dirname "$f")"
+        if ! download "$WG_FILES_BASE/$f" "$UPD_TMP/$f" 2>/dev/null || [ ! -s "$UPD_TMP/$f" ]; then
+            warn "$f не скачался — оставляю прежний"
+            continue
+        fi
+        if [ -f "$f" ] && cmp -s "$f" "$UPD_TMP/$f"; then
+            continue
+        fi
+        if [ -f "$f" ]; then
+            cp "$f" "$f.bak-$STAMP"
+            info "$f обновлён (прежний: $f.bak-$STAMP)"
+        else
+            info "$f добавлен"
+        fi
+        mkdir -p "$(dirname "$f")"
+        cp "$UPD_TMP/$f" "$f"
+        ИЗМЕНЕНО=$((ИЗМЕНЕНО+1))
+    done
+    rm -rf "$UPD_TMP"
+    [ "$ИЗМЕНЕНО" = "0" ] && info "файлы развёртывания не менялись"
+
+    БЫЛО="$(curl -s -m 5 http://127.0.0.1:${WG_HTTP_PORT:-8080}/healthz 2>/dev/null || true)"
 fi
-
-# ── Запись .env ─────────────────────────────────────────────────────────────
-# ── Запуск ──────────────────────────────────────────────────────────────────
-# Кладём выбор образа в .env: дальше человек работает обычным
-# docker compose, без установщика, и должен получать ТО ЖЕ самое.
-set_value WATCHGOOSE_IMAGE "$WATCHGOOSE_IMAGE"
-set_value WATCHGOOSE_TAG "$WATCHGOOSE_TAG"
-
-say "Записываю $ENV_FILE"
-# ⚠️ Права ставим ДО первого байта, а не после записи.
-#
-# Перенаправление создаёт файл с 0666 & ~umask, то есть на типовой машине
-# 0644, и он остаётся читаемым всем, пока блок ниже отрабатывает вместе
-# с подпроцессом sort. Внутри к тому времени уже лежат PG_PASS, CH_PASS,
-# INGEST_TOKEN, MINI_APP_SECRET и ARCHIVE_ENCRYPTION_KEY — одного чтения
-# в этом окне хватает. chmod после записи оставлен страховкой.
-: > "$ENV_FILE"
-chmod 600 "$ENV_FILE"
-{
-    echo "# Создан install.sh — правьте руками, скрипт заданное не перетирает."
-    for key in "${!ENV_VALUES[@]}"; do
-        printf '%s=%s\n' "$key" "${ENV_VALUES[$key]}"
-    done | sort
-} > "$ENV_FILE"
-chmod 600 "$ENV_FILE"
-info "права 600: внутри секреты"
-
 
 say "Беру сборку $WATCHGOOSE_TAG"
 
