@@ -1,0 +1,135 @@
+# OpenTelemetry Collector — единая точка приёма и роутинг сигналов (12.2).
+#
+#   логи    → watchgoose (fingerprint, детекторы, знание)
+#   трейсы  → ClickHouse напрямую + spanmetrics
+#   метрики → VictoriaMetrics
+
+receivers:
+  otlp:
+    protocols:
+      # ⚠️ Приёмник ЗАКРЫТ ТОКЕНОМ.
+      #
+      # Без этого коллектор принимал что угодно от кого угодно: проверено
+      # запросом без заголовка — отвечал 200. При этом watchgoose на такой же
+      # запрос отвечает 401, но толку от этого не было никакого: напрямую
+      # в него никто не пишет, все шлют сюда.
+      #
+      # Получалось отмывание: неаутентифицированный вход превращался
+      # в аутентифицированный, потому что дальше коллектор подставлял
+      # валидный токен сам. Чужие логи заводили инциденты, чужие метрики
+      # и трейсы уходили в ClickHouse и VictoriaMetrics, где проверок нет
+      # вовсе, а поток достаточного объёма вытеснял настоящие данные
+      # по бюджету хранения.
+      grpc:
+        endpoint: 0.0.0.0:4317
+        auth: {authenticator: bearertokenauth/ingest}
+      http:
+        endpoint: 0.0.0.0:4318
+        auth: {authenticator: bearertokenauth/ingest}
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 5000
+    send_batch_max_size: 10000
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 15
+
+  # ⚠️ Режем только заведомый мусор. Вероятностного сэмплирования здесь НЕТ:
+  # по сэмплу нельзя считать агрегаты, а аналитика по трейсам — равноправный
+  # первичный сценарий (раздел 3).
+  filter/drop-noise:
+    error_mode: ignore
+    traces:
+      span:
+        - 'attributes["http.route"] == "/healthz"'
+        - 'attributes["http.route"] == "/readyz"'
+        - 'attributes["http.route"] == "/metrics"'
+        - 'attributes["http.route"] == "/favicon.ico"'
+
+connectors:
+  # Метрики по 100% спанов, до любых фильтров: точные RPS, p50/p95/p99
+  # и доля ошибок по каждой операции. Дашборды живут на них и отвечают
+  # мгновенно, в ClickHouse проваливаются только за конкретикой.
+  spanmetrics:
+    histogram:
+      explicit:
+        buckets: [1ms, 10ms, 50ms, 100ms, 500ms, 1s, 5s, 30s]
+    dimensions:
+      - name: http.status_code
+      - name: region
+      - name: point_type
+
+exporters:
+  otlphttp/logs:
+    endpoint: http://watchgoose:4318
+    # ⚠️ Приёму нужен токен роли ingest, иначе он отвечает 401 и логи
+    # не доходят вообще. Секрет один и тот же с обеих сторон: здесь
+    # INGEST_TOKEN — выпустите его командой
+    #   watchgoose --issue-token=otel-collector --token-role=ingest
+    # Пустая переменная означает открытый приём — тогда заголовок ни на что
+    # не влияет и мешать не будет.
+    headers:
+      authorization: "Bearer ${env:INGEST_TOKEN}"
+    sending_queue:
+      enabled: true
+      storage: file_storage      # буфер на диске при падении бэкенда
+      num_consumers: 4
+      queue_size: 5000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 10m
+
+  clickhouse/traces:
+    endpoint: tcp://clickhouse:9000
+    database: otel
+    username: watchgoose
+    password: ${env:CH_PASS}
+    traces_table_name: otel_traces
+    ttl: 2160h                   # 90 дней (16.6), retention декларативно
+    create_schema: true          # схему создаёт экспортёр
+    timeout: 10s
+    sending_queue:
+      enabled: true
+      queue_size: 1000
+
+  prometheusremotewrite/metrics:
+    endpoint: http://victoria:8428/api/v1/write
+    resource_to_telemetry_conversion:
+      enabled: true
+
+extensions:
+  file_storage:
+    directory: /var/lib/otelcol
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+  # ⚠️ Тот же токен, что предъявляет сам коллектор, когда пишет
+  # в watchgoose. Один секрет на весь путь телеметрии: разъедутся —
+  # отправители получат 401 на входе, и это будет видно сразу,
+  # а не обнаружится через неделю по пустому поиску.
+  bearertokenauth/ingest:
+    scheme: Bearer
+    token: ${env:INGEST_TOKEN}
+
+service:
+  extensions: [file_storage, health_check, bearertokenauth/ingest]
+  telemetry:
+    logs: {level: info}
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/logs]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/drop-noise, batch]
+      exporters: [clickhouse/traces, spanmetrics]
+    metrics:
+      receivers: [otlp, spanmetrics]
+      processors: [memory_limiter, batch]
+      exporters: [prometheusremotewrite/metrics]

@@ -1,0 +1,73 @@
+<?xml version="1.0"?>
+<!--
+  Ограничение собственных журналов ClickHouse.
+
+  ⚠️ По умолчанию ClickHouse пишет в себя больше, чем в него пишем мы.
+  Замер на стенде: полезные данные (otel_traces) занимали 55 МиБ,
+  а системные журналы — 436 МиБ, то есть в восемь раз больше:
+
+      text_log                 149 МиБ      4 071 578 строк
+      asynchronous_metric_log  148 МиБ    277 988 058 строк
+      trace_log                 82 МиБ      4 941 454 строк
+      metric_log                56 МиБ        458 324 строк
+
+  Это же объясняет и расход памяти: буферы всех этих журналов живут
+  в процессе.
+
+  ⚠️ Совсем отключать их нельзя. Когда ClickHouse откажет, разбираться
+  придётся именно по ним: query_log отвечает, какой запрос всё положил,
+  а part_log — что происходило со слияниями. Поэтому здесь не отключение,
+  а сроки хранения и разумная частота.
+-->
+<clickhouse>
+    <!--
+      asynchronous_metric_log — главный источник строк: сотни метрик
+      состояния сервера каждую секунду. 278 миллионов строк на стенде,
+      который почти ничего не делал. Для разбора аварий он не нужен:
+      состояние сервера мы и так снимаем своим сбором метрик.
+    -->
+    <asynchronous_metric_log remove="1"/>
+
+    <!--
+      trace_log — стеки для профилирования. Нужен разработчикам
+      ClickHouse, не нам.
+    -->
+    <trace_log remove="1"/>
+
+    <!-- Внутренние журналы работы движка: полезны только при отладке. -->
+    <processors_profile_log remove="1"/>
+    <query_views_log remove="1"/>
+
+    <!--
+      Остальные оставлены, но с ограниченным сроком.
+
+      text_log — текстовый журнал сервера, по нему видно причину отказа.
+      Уровень поднят до warning: на debug он и набрал свои 149 МиБ.
+    -->
+    <text_log>
+        <level>warning</level>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+        <flush_interval_milliseconds>15000</flush_interval_milliseconds>
+    </text_log>
+
+    <!-- query_log — какой запрос сколько занял и чем закончился. -->
+    <query_log>
+        <ttl>event_date + INTERVAL 14 DAY DELETE</ttl>
+        <flush_interval_milliseconds>15000</flush_interval_milliseconds>
+    </query_log>
+
+    <!-- metric_log — счётчики сервера. Раз в 15 секунд вместо секунды. -->
+    <metric_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+        <collect_interval_milliseconds>15000</collect_interval_milliseconds>
+        <flush_interval_milliseconds>15000</flush_interval_milliseconds>
+    </metric_log>
+
+    <!-- part_log — слияния и мутации: нужен при разборе роста диска. -->
+    <part_log>
+        <ttl>event_date + INTERVAL 14 DAY DELETE</ttl>
+        <flush_interval_milliseconds>15000</flush_interval_milliseconds>
+    </part_log>
+
+    <!-- error_log маленький и полезен: оставлен как есть. -->
+</clickhouse>
