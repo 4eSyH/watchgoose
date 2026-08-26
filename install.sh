@@ -66,7 +66,7 @@ done
 # из своей ветки или ставят из форка, не правя скрипт.
 #
 #     WG_REF=develop ./install.sh          — файлы из другой ветки
-#     WATCHGOOSE_TAG=1.0.1 ./install.sh    — поставить конкретный выпуск
+#     WATCHGOOSE_TAG=1.0.3 ./install.sh    — поставить конкретный выпуск
 WG_PROJECT="${WG_PROJECT:-4eSyH/watchgoose}"
 WG_REF="${WG_REF:-main}"
 

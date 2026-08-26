@@ -16,7 +16,22 @@
 # тот же непривилегированный пользователь.
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates tzdata && \
+# ⚠️ Набор пакетов ТОТ ЖЕ, что в корневом Dockerfile, слово в слово.
+#
+# postgresql17-client несёт pg_dump, pg_restore и psql: без них недельная
+# копия PostgreSQL не снимается, а восстановить её нечем. Именно этот файл
+# собирает образ на машине заказчика (install.sh), поэтому расхождение
+# означало бы, что резерв есть в разработке и его нет там, где он нужен.
+#
+# ⚠️ Версия названа ТОЧНО: pg_dump старше сервера снимать дамп
+# отказывается, а пакет без номера в будущем выпуске alpine может
+# принести другой мажор. Пусть выпадение пакета ломает сборку громко.
+#
+# ⚠️ Сеть при сборке нужна и была нужна раньше: ca-certificates и tzdata
+# тоже тянутся из репозиториев alpine. Нового класса отказов не появляется.
+#
+# Цена: +5,1 МиБ распакованными.
+RUN apk add --no-cache ca-certificates tzdata postgresql17-client && \
     adduser -D -u 10001 -h /var/lib/watchgoose watchgoose && \
     mkdir -p /var/lib/watchgoose/wal && \
     chown -R watchgoose:watchgoose /var/lib/watchgoose
