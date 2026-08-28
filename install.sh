@@ -107,7 +107,19 @@ ENV_FILE=".env"
 WATCHGOOSE_TAG="${WATCHGOOSE_TAG:-latest}"
 export WATCHGOOSE_TAG
 
-COMPOSE="docker compose -f deploy/docker-compose.yml"
+# ⚠️ --env-file обязателен, и вот почему его нельзя опускать.
+#
+# Файл .env установщик пишет в СВОЙ каталог, а compose с флагом
+# -f deploy/docker-compose.yml считает каталогом проекта deploy/
+# и ищет .env там. Не найдя, он подставляет пустые значения во все
+# ${...} — и подъём падает списком «required variable CH_PASS is
+# missing a value» по каждому секрету, который установщик только что
+# сгенерировал и записал.
+#
+# Со стороны это выглядит как поломка установки, хотя .env на месте
+# и заполнен: не сошлись каталоги, а не данные. Ровно та же строка
+# в Makefile флаг несёт — расхождение и было причиной.
+COMPOSE="docker compose -f deploy/docker-compose.yml --env-file $ENV_FILE"
 
 # ── Вывод ───────────────────────────────────────────────────────────────────
 say()  { printf '\n\033[1m%s\033[0m\n' "$*"; }
