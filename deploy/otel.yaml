@@ -63,8 +63,18 @@ connectors:
       - name: point_type
 
 exporters:
-  otlphttp/logs:
-    endpoint: http://watchgoose:4318
+  # ⚠️ Логи идут в watchgoose по gRPC на 4317, а не по HTTP на 4318.
+  #
+  # Приёмник у watchgoose один — gRPC. Это тот же порт и тот же протокол,
+  # которым приложения шлют трассировки и метрики: один адрес на всё,
+  # без второго транспорта и без склейки адреса заменой цифры в порту.
+  #
+  # tls.insecure здесь честно: связь идёт по внутренней сети compose,
+  # наружу этот порт watchgoose не публикует вовсе.
+  otlp/logs:
+    endpoint: watchgoose:4317
+    tls:
+      insecure: true
     # ⚠️ Приёму нужен токен роли ingest, иначе он отвечает 401 и логи
     # не доходят вообще. Секрет один и тот же с обеих сторон: здесь
     # INGEST_TOKEN — выпустите его командой
@@ -124,7 +134,7 @@ service:
     logs:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [otlphttp/logs]
+      exporters: [otlp/logs]
     traces:
       receivers: [otlp]
       processors: [memory_limiter, filter/drop-noise, batch]
