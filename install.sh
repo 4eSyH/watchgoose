@@ -198,6 +198,10 @@ service_of() {
         deploy/scrape.yml)            printf 'vmagent' ;;
         deploy/clickhouse/logs.xml)   printf 'clickhouse' ;;
         deploy/vm-aggr.yaml)          printf 'victoria' ;;
+        # ⚠️ Правила тревог сами не перечитываются: vmalert читает их при
+        # старте. Без перезапуска обновлённый файл лежал бы на диске,
+        # а работали бы прежние правила — и разошлось бы это молча.
+        deploy/rules/watchgoose.yml)  printf 'vmalert' ;;
         *)                            printf '' ;;
     esac
 }
@@ -374,7 +378,7 @@ if [ ! -f deploy/docker-compose.yml ]; then
     info "проект: $WG_PROJECT (ветка $WG_REF)"
     for f in deploy/docker-compose.yml deploy/otel.yaml deploy/scrape.yml \
              deploy/Caddyfile deploy/clickhouse/logs.xml deploy/vm-aggr.yaml \
-             deploy/Dockerfile.release; do
+             deploy/rules/watchgoose.yml deploy/Dockerfile.release; do
         fetch "$f" "$f" || die "не удалось скачать $f — проверьте WG_PROJECT и доступность сети"
     done
     # ⚠️ Файлы Grafana сюда НЕ входят.
@@ -685,7 +689,7 @@ else
     # умирало сразу после заголовка «Обновляю файлы развёртывания»,
     # и bash -n этого не ловит — ошибка возникает только при исполнении.
     CHANGED=0
-    for f in deploy/docker-compose.yml deploy/otel.yaml deploy/scrape.yml              deploy/Caddyfile deploy/clickhouse/logs.xml deploy/vm-aggr.yaml              deploy/Dockerfile.release; do
+    for f in deploy/docker-compose.yml deploy/otel.yaml deploy/scrape.yml              deploy/Caddyfile deploy/clickhouse/logs.xml deploy/vm-aggr.yaml              deploy/rules/watchgoose.yml deploy/Dockerfile.release; do
         mkdir -p "$UPD_TMP/$(dirname "$f")"
         if ! download "$WG_FILES_BASE/$f" "$UPD_TMP/$f" 2>/dev/null || [ ! -s "$UPD_TMP/$f" ]; then
             warn "$f не скачался — оставляю прежний"
