@@ -26,7 +26,18 @@ scrape_configs:
   - job_name: infra
     static_configs:
       - targets:
-          - 'manticore:9308'
+          # ⚠️ Manticore здесь БОЛЬШЕ НЕТ, и это не потеря.
+          #
+          # Порт 9308 — её HTTP-приёмник запросов, а не отдача метрик:
+          # на /metrics он отвечает 404 с «no such index [metrics]».
+          # Prometheus-эндпоинта у Manticore нет вовсе, состояние она
+          # отдаёт только через SHOW STATUS по SQL. Цель стояла тут
+          # с самого начала и всё это время была вечно недоступной —
+          # то есть держала алерт «служба недоступна» постоянно зажжённым.
+          #
+          # Что происходит с логами, видно по метрикам самого watchgoose:
+          # watchgoose_ingest_records_total, _dropped_total, глубина
+          # очереди и прогноз хранения. Их и собираем, задание watchgoose.
           - 'clickhouse:9363'
           - 'postgres-exporter:9187'
           # ⚠️ VictoriaMetrics обязана собирать САМА СЕБЯ.

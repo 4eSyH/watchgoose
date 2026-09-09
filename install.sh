@@ -377,6 +377,31 @@ fetch() {
     info "$dest — скачан"
 }
 
+# ⚠️ Объявлена ЗДЕСЬ, а не ниже по файлу, и это не вкусовщина.
+#
+# download стояла рядом с закачкой бинарника — то есть на четыреста строк
+# НИЖЕ, чем цикл обновления файлов развёртывания, который её зовёт. Bash
+# читает файл сверху вниз: к моменту вызова функции ещё не существует,
+# вызов падает с «command not found», а вызывающий заворачивает stderr
+# в /dev/null и печатает «не скачался — оставляю прежний».
+#
+# Отказ выглядел как проблема с сетью и был полным: НИ ОДИН из восьми
+# файлов не обновлялся никогда. Сервер получал новый бинарник в окружении
+# многомесячной давности — без служб, добавленных с тех пор в compose,
+# без новых настроек коллектора. Проверено на боевой установке: там лежал
+# compose на двенадцать дней старше выпуска, который на нём работал.
+#
+# bash -n такое не ловит: синтаксис верен, ошибка возникает только при
+# исполнении — ровно как с кириллическим именем переменной ниже.
+download() {
+    local url="$1" dest="$2"
+    if command -v curl >/dev/null; then
+        curl -fsSL "$url" -o "$dest"
+    else
+        wget -qO "$dest" "$url"
+    fi
+}
+
 if [ ! -f deploy/docker-compose.yml ]; then
     say "Забираю файлы развёртывания"
     info "проект: $WG_PROJECT (ветка $WG_REF)"
@@ -693,10 +718,14 @@ else
     # умирало сразу после заголовка «Обновляю файлы развёртывания»,
     # и bash -n этого не ловит — ошибка возникает только при исполнении.
     CHANGED=0
-    for f in deploy/docker-compose.yml deploy/otel.yaml deploy/scrape.yml              deploy/Caddyfile deploy/clickhouse/logs.xml deploy/vm-aggr.yaml              deploy/rules/watchgoose.yml deploy/Dockerfile.release; do
+    FAILED=0
+    for f in deploy/docker-compose.yml deploy/otel.yaml deploy/scrape.yml \
+             deploy/Caddyfile deploy/clickhouse/logs.xml deploy/vm-aggr.yaml \
+             deploy/rules/watchgoose.yml deploy/Dockerfile.release; do
         mkdir -p "$UPD_TMP/$(dirname "$f")"
         if ! download "$WG_FILES_BASE/$f" "$UPD_TMP/$f" 2>/dev/null || [ ! -s "$UPD_TMP/$f" ]; then
             warn "$f не скачался — оставляю прежний"
+            FAILED=$((FAILED+1))
             continue
         fi
         if [ -f "$f" ] && cmp -s "$f" "$UPD_TMP/$f"; then
@@ -718,7 +747,16 @@ else
     #
     # Под set -e список с && возвращает код теста, и когда файлы всё-таки
     # менялись, последняя строка ветки завершалась неуспехом.
-    if [ "$CHANGED" = "0" ]; then
+    # ⚠️ «Не менялись» и «не смогли скачать» — РАЗНЫЕ ответы.
+    #
+    # Раньше печаталось одно и то же: после восьми предупреждений подряд
+    # шла успокаивающая строка «файлы развёртывания не менялись», и весь
+    # отказ читался как штатный ход. Именно так необновляемое окружение
+    # и прожило незамеченным.
+    if [ "$FAILED" -gt 0 ]; then
+        warn "не скачалось файлов: $FAILED — окружение осталось прежним"
+        warn "новая сборка поедет на старом compose: проверьте сеть и $WG_FILES_BASE"
+    elif [ "$CHANGED" = "0" ]; then
         info "файлы развёртывания не менялись"
     fi
 
@@ -752,15 +790,6 @@ fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-
-download() {
-    local url="$1" dest="$2"
-    if command -v curl >/dev/null; then
-        curl -fsSL "$url" -o "$dest"
-    else
-        wget -qO "$dest" "$url"
-    fi
-}
 
 info "скачиваю $BIN_NAME"
 download "$BIN_URL" "$WORK/$BIN_NAME" || die "не удалось скачать сборку: $BIN_URL"
@@ -837,6 +866,29 @@ info "образ $WATCHGOOSE_IMAGE:$WATCHGOOSE_TAG готов"
 say "Поднимаю стек"
 PROFILES=()
 [ "$(get WG_TLS_MODE)" = "off" ] || PROFILES+=(--profile tls)
+
+# ⚠️ Метрики хоста включаются ЗДЕСЬ, иначе алерт про место на диске мёртв.
+#
+# node-exporter лежит под профилем host-metrics, а установщик его не
+# включал — то есть ряда node_filesystem_avail_bytes не существовало,
+# а на нём стоит правило «РазделЗаканчивается». Правило исправно
+# загружалось в vmalert, показывало health=ok и не могло сработать
+# никогда: единственный алерт про кончающийся диск был декорацией.
+#
+# Цена ошибки тут выше остальных: когда раздел кончается, встают ВСЕ
+# хранилища сразу, а очередь коллектора в этот момент только растёт.
+#
+# ⚠️ Кроме Docker Desktop. Там node-exporter монтирует корень хоста,
+# которого у него нет: контейнеры живут в виртуальной машине. Compose
+# в таком случае падает целиком — «path / is mounted on / but it is not
+# a shared or slave mount», — то есть из-за необязательной части
+# не поднимается ничего. Ровно ради этого профиль и заведён.
+if docker info --format '{{.OperatingSystem}}' 2>/dev/null | grep -qi "docker desktop"; then
+    warn "Docker Desktop: метрики хоста пропущены — там нет корня машины"
+    warn "алерт «РазделЗаканчивается» работать не будет: следите за местом сами"
+else
+    PROFILES+=(--profile host-metrics)
+fi
 # ⚠️ Раскрытие пустого массива под set -u — ошибка в bash до 4.4,
 # поэтому ветвимся, а не полагаемся на "${PROFILES[@]:-}".
 if [ ${#ARCHIVE_PROFILES[@]} -gt 0 ]; then
