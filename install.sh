@@ -780,19 +780,50 @@ esac
 info "архитектура: $ARCH"
 
 BIN_NAME="watchgoose_linux_${ARCH}"
+BIN_URL_ALT=""
+SUM_URL_ALT=""
 if [ "$WATCHGOOSE_TAG" = "latest" ]; then
     BIN_URL="$WG_RELEASES/latest/download/$BIN_NAME"
     SUM_URL="$WG_RELEASES/latest/download/checksums.txt"
 else
+    # ⚠️ Тег пробуется в ДВУХ написаниях: 1.0.8 и v1.0.8.
+    #
+    # Релизы называются с буквой, а в .env закрепляется то, что сказал
+    # о себе бинарник, — и там она есть не всегда: номер собирается либо
+    # из тега (тогда «v1.0.8»), либо из файла VERSION (тогда «1.0.8»).
+    # Совпадёт написание или нет, зависело от того, поставили тег до
+    # сборки или после.
+    #
+    # Проверено на живых релизах: .../download/v1.0.8/... отдаёт 200,
+    # .../download/1.0.8/... — 404. То есть половина закреплённых версий
+    # не скачивалась вовсе, и откат «--update --tag=1.0.8» падал бы
+    # с «не удалось скачать сборку» — на ровном месте и в худший момент,
+    # когда откатываются обычно после неудачного обновления.
+    case "$WATCHGOOSE_TAG" in
+        v*) ALT_TAG="${WATCHGOOSE_TAG#v}" ;;
+        *)  ALT_TAG="v$WATCHGOOSE_TAG" ;;
+    esac
     BIN_URL="$WG_RELEASES/download/$WATCHGOOSE_TAG/$BIN_NAME"
     SUM_URL="$WG_RELEASES/download/$WATCHGOOSE_TAG/checksums.txt"
+    BIN_URL_ALT="$WG_RELEASES/download/$ALT_TAG/$BIN_NAME"
+    SUM_URL_ALT="$WG_RELEASES/download/$ALT_TAG/checksums.txt"
 fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 info "скачиваю $BIN_NAME"
-download "$BIN_URL" "$WORK/$BIN_NAME" || die "не удалось скачать сборку: $BIN_URL"
+if ! download "$BIN_URL" "$WORK/$BIN_NAME" 2>/dev/null || [ ! -s "$WORK/$BIN_NAME" ]; then
+    # Второе написание тега — см. пояснение выше, где строились адреса.
+    if [ -n "$BIN_URL_ALT" ] && download "$BIN_URL_ALT" "$WORK/$BIN_NAME" 2>/dev/null \
+        && [ -s "$WORK/$BIN_NAME" ]; then
+        info "тег нашёлся как $ALT_TAG"
+        BIN_URL="$BIN_URL_ALT"
+        SUM_URL="$SUM_URL_ALT"
+    else
+        die "не удалось скачать сборку: $BIN_URL"
+    fi
+fi
 [ -s "$WORK/$BIN_NAME" ] || die "сборка скачалась пустой"
 
 # ⚠️ Контрольная сумма проверяется ОБЯЗАТЕЛЬНО.

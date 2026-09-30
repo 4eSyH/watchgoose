@@ -23,6 +23,42 @@ scrape_configs:
     static_configs:
       - targets: ['watchgoose:9090']
 
+  # ⚠️ ClickHouse опрашивается, но его метрики НЕ СОХРАНЯЮТСЯ — ни одна.
+  #
+  # Его /metrics отдаёт около двух тысяч имён: 700 счётчиков событий
+  # (ProfileEvents), 600 счётчиков по кодам ошибок (ErrorMetric), 350
+  # асинхронных показателей, среди которых по десятку на каждое ядро
+  # процессора (OSIrqTimeCPU0…CPU15), и 300 текущих. Собранные целиком,
+  # они заняли в каталоге метрик две трети всех имён — больше, чем все
+  # сервисы, инфраструктура и сама система вместе, — и выбрать в нём
+  # свою метрику стало нельзя.
+  #
+  # Пользоваться ими некому: ни правило тревоги, ни дашборд, ни код на них
+  # не смотрят. Объём трассировок watchgoose считает сам, запросом
+  # к system.parts, а разбирать отказ ClickHouse удобнее его же таблицами
+  # — system.parts, system.merges, query_log, part_log, — они сохранены
+  # в clickhouse/logs.xml со сроком хранения.
+  #
+  # Нужно от ClickHouse одно: жив ли он. Для этого цель и оставлена —
+  # vmagent сам пишет к каждой цели up и scrape_*, и отбор ниже их
+  # не касается. Так работает тревога «СлужбаНедоступна» (up == 0)
+  # в rules/watchgoose.yml.
+  #
+  # Порт 9363 в clickhouse/logs.xml при этом не закрыт намеренно: без
+  # него up станет нулём навсегда и тревога будет гореть постоянно,
+  # а правка logs.xml перезапускает ClickHouse при обновлении.
+  #
+  # Понадобится какая-то метрика — замените drop на keep со списком имён.
+  # Проверка internal/deploy/scrape_test.go следит, чтобы сюда не вернулся
+  # сбор всего подряд.
+  - job_name: clickhouse
+    static_configs:
+      - targets: ['clickhouse:9363']
+    metric_relabel_configs:
+      - action: drop
+        source_labels: [__name__]
+        regex: '.+'
+
   - job_name: infra
     static_configs:
       - targets:
@@ -38,7 +74,8 @@ scrape_configs:
           # Что происходит с логами, видно по метрикам самого watchgoose:
           # watchgoose_ingest_records_total, _dropped_total, глубина
           # очереди и прогноз хранения. Их и собираем, задание watchgoose.
-          - 'clickhouse:9363'
+          #
+          # ClickHouse — своим заданием выше: там только признак живости.
           - 'postgres-exporter:9187'
           # ⚠️ VictoriaMetrics обязана собирать САМА СЕБЯ.
           #
@@ -48,6 +85,16 @@ scrape_configs:
           # нельзя измерить, нельзя и уместить в бюджет: доля метрик
           # оставалась бы гаданием.
           - 'victoria:8428'
+    metric_relabel_configs:
+      # ⚠️ pg_settings_* — это postgresql.conf, а не состояние базы.
+      #
+      # 270 имён, по одному на каждый параметр настройки, и почти все
+      # постоянны от перезапуска до перезапуска. Смотреть на них графиком
+      # незачем, а в каталоге метрик они хоронили pg_stat_* — то, ради
+      # чего экспортёр и стоит. Оставлен один max_connections: без него
+      # число соединений не с чем сравнить.
+      - action: drop
+        if: '{__name__=~"pg_settings_.+", __name__!="pg_settings_max_connections"}'
 
   - job_name: otel-collector
     static_configs:
